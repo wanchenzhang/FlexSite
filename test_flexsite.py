@@ -3,6 +3,10 @@ import math
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import flexsite
 
 from flexsite import (
     SIDECHAIN_ATOMS,
@@ -142,6 +146,83 @@ class PairwiseScoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["structure_coverage"], "1.000000")
         self.assertEqual(rows[0]["max_pair_structure_1"], "s1")
         self.assertEqual(rows[0]["max_pair_structure_2"], "s2")
+
+    def test_coverage_counts_only_structures_in_valid_pairs(self):
+        key = ("A", "10", "GLY")
+        score = compute_pairwise_scores({
+            "complete1": {key: residue(0.0)},
+            "complete2": {key: residue(1.0)},
+            "incomplete": {key: {"CA": (0.0, 0.0, 0.0)}},
+        })[0]
+        self.assertEqual(score.n_structures, 2)
+        self.assertAlmostEqual(score.structure_coverage, 2.0 / 3.0)
+
+    def test_pair_coverage_reports_missing_comparisons(self):
+        key = ("A", "10", "GLY")
+        score = compute_pairwise_scores({
+            "s1": {key: residue(0.0)},
+            "s2": {key: residue(1.0)},
+            "s3": {},
+        })[0]
+        self.assertEqual(score.possible_pairs, 3)
+        self.assertAlmostEqual(score.pair_coverage, 1.0 / 3.0)
+
+    def test_nonfinite_coordinates_do_not_produce_nan_scores(self):
+        key = ("A", "10", "GLY")
+        damaged = residue(1.0)
+        damaged["O"] = (math.nan, 0.0, 0.0)
+        score = compute_pairwise_scores({
+            "s1": {key: residue(0.0)}, "s2": {key: damaged},
+        })[0]
+        self.assertAlmostEqual(score.mean_pairwise, 1.0)
+        self.assertEqual(score.min_atoms_per_pair, 3)
+
+    def test_invalid_color_limits_are_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    flexsite._optional_float(value)
+
+
+class ExtractionTests(unittest.TestCase):
+    def atom(self, name, alt, coord, occupancy=1.0, resn="SER"):
+        return SimpleNamespace(
+            name=name, alt=alt, coord=coord, q=occupancy,
+            chain="A", resi="10", resn=resn,
+        )
+
+    def extract(self, atoms, **kwargs):
+        model = SimpleNamespace(atom=atoms)
+        with patch.object(flexsite, "cmd", SimpleNamespace(get_model=lambda *a, **k: model)):
+            return flexsite._extract_structure("mobile", [("A", "10", "SER")], **kwargs)
+
+    def test_alternate_conformers_are_not_mixed_atom_by_atom(self):
+        coordinates = self.extract([
+            self.atom("CA", "", (0.0, 0.0, 0.0)),
+            self.atom("CB", "A", (1.0, 0.0, 0.0)),
+            self.atom("CB", "B", (2.0, 0.0, 0.0)),
+            self.atom("OG", "B", (3.0, 0.0, 0.0)),
+        ])[('A', '10', 'SER')]
+        self.assertEqual(coordinates["CB"], (1.0, 0.0, 0.0))
+        self.assertNotIn("OG", coordinates)
+
+    def test_zero_occupancy_atoms_are_not_observations(self):
+        self.assertEqual(self.extract([
+            self.atom("CB", "", (1.0, 0.0, 0.0), occupancy=0.0),
+        ]), {})
+
+    def test_non_a_alternate_uses_highest_residue_occupancy(self):
+        coordinates = self.extract([
+            self.atom("CB", "B", (1.0, 0.0, 0.0), occupancy=0.8),
+            self.atom("CB", "C", (2.0, 0.0, 0.0), occupancy=0.2),
+        ])[('A', '10', 'SER')]
+        self.assertEqual(coordinates["CB"], (1.0, 0.0, 0.0))
+
+    def test_sidechain_mapping_skips_mutated_residue(self):
+        mapping = {("A", "10", "THR"): ("A", "10", "SER")}
+        self.assertEqual(self.extract([
+            self.atom("CB", "", (1.0, 0.0, 0.0), resn="THR"),
+        ], residue_map=mapping, require_same_resn=True), {})
 
 
 if __name__ == "__main__":

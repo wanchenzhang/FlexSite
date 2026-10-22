@@ -1,0 +1,2 @@
+# Preserve downloaded coordinate files byte-for-byte, including source spacing.
+structures/*.cif -text -whitespace
