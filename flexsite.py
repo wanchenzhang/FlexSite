@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass
 from itertools import combinations
+from uuid import uuid4
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 try:
@@ -70,10 +71,86 @@ class ResidueScore:
     def structure_coverage(self) -> float:
         return self.n_structures / self.total_structures if self.total_structures else 0.0
 
+    @property
+    def possible_pairs(self) -> int:
+        return self.total_structures * (self.total_structures - 1) // 2
+
+    @property
+    def pair_coverage(self) -> float:
+        return self.n_pairs / self.possible_pairs if self.possible_pairs else 0.0
+
 
 _LAST_SCORES: List[ResidueScore] = []
 _LAST_OUTPUT_OBJECT: Optional[str] = None
 _LAST_MIN_STRUCTURE_FRACTION: float = 0.0
+_VIEW_SETTINGS: Dict[str, dict] = {}
+_OWNER_PROPERTY = "_flexsite_owner"
+
+
+def _view_settings(output: str) -> dict:
+    if stored is not None:
+        return dict(getattr(stored, "flexsite_views", {}).get(output, {}))
+    return dict(_VIEW_SETTINGS.get(output, {}))
+
+
+def _remember_view(output: str, site: str, minimum: float, maximum: float,
+                   representation: str) -> None:
+    settings = dict(site=site, minimum=minimum, maximum=maximum,
+                    representation=representation,
+                    owner=cmd.get_property(_OWNER_PROPERTY, output))
+    _VIEW_SETTINGS[output] = settings
+    if stored is not None:
+        views = dict(getattr(stored, "flexsite_views", {}))
+        views[output] = settings
+        stored.flexsite_views = views
+
+
+def _owns_output(output: str) -> bool:
+    owner = _view_settings(output).get("owner")
+    return bool(owner and output in cmd.get_names("objects")
+                and cmd.get_property(_OWNER_PROPERTY, output) == owner)
+
+
+def _validate_colorbar_names(output: str) -> None:
+    names = cmd.get_names("all")
+    bar = f"{output}_colorbar"
+    labels = f"{bar}_labels"
+    owner = cmd.get_property(_OWNER_PROPERTY, output)
+    owned_labels = (
+        labels in names and owner
+        and cmd.get_type(labels) == "object:molecule"
+        and cmd.get_property(_OWNER_PROPERTY, labels) == owner
+    )
+    if labels in names and not owned_labels:
+        raise ValueError(f"Color-bar name belongs to another object: {labels}")
+    # CGO objects do not support object properties; verify their type and the
+    # marked molecular label companion before deleting or regenerating them.
+    if bar in names and (cmd.get_type(bar) != "object:cgo" or not owned_labels):
+        raise ValueError(f"Color-bar name belongs to another object: {bar}")
+
+
+def _validate_output_name(output: str, inputs: Sequence[str]) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_]+", output) or output.lower() in ("all", "none"):
+        raise ValueError("output_object must contain only letters, digits, or underscores")
+    generated_names = (
+        output, f"{output}_site", f"{output}_site_backbone",
+        f"{output}_site_sidechain", f"{output}_colorbar", f"{output}_colorbar_labels",
+    )
+    if any(name in inputs for name in generated_names):
+        raise ValueError("output_object must not replace an input structure")
+    names = cmd.get_names("all")
+    if not _owns_output(output):
+        for name in generated_names:
+            if name in names:
+                raise ValueError(f"Output name already exists: {name}; choose another output_object")
+    else:
+        for name in generated_names[1:4]:
+            if name in names and (
+                cmd.get_type(name) != "selection"
+                or set(cmd.get_object_list(name)) != {output}
+            ):
+                raise ValueError(f"Output selection name already exists: {name}")
+        _validate_colorbar_names(output)
 
 
 def _cached_scores() -> List[ResidueScore]:
@@ -119,6 +196,10 @@ def _distance(a: Coord, b: Coord) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
+def _valid_coord(coord: Sequence[float]) -> bool:
+    return len(coord) == 3 and all(math.isfinite(value) for value in coord)
+
+
 def _blue_white_red(value: float, minimum: float, maximum: float) -> Tuple[float, float, float]:
     """Return an RGB value using a linear blue-white-red palette."""
     if maximum <= minimum:
@@ -139,14 +220,18 @@ def _matched_atom_pairs(
     residue_name: str = "",
     symmetry_aware: bool = False,
 ) -> Optional[List[Tuple[str, str, float]]]:
-    common = [name for name in atom_names if name in first and name in second]
+    common = [
+        name for name in atom_names
+        if name in first and name in second
+        and _valid_coord(first[name]) and _valid_coord(second[name])
+    ]
     if len(common) < min_atoms:
         return None
 
     mappings: List[Dict[str, str]] = [{}]
     swaps = SIDECHAIN_SYMMETRY_SWAPS.get(residue_name.upper(), ())
     swap_atoms = {name for pair in swaps for name in pair}
-    if symmetry_aware and swaps and swap_atoms.issubset(first) and swap_atoms.issubset(second):
+    if symmetry_aware and swaps and swap_atoms.issubset(common):
         swapped: Dict[str, str] = {}
         for left, right in swaps:
             swapped[left] = right
@@ -229,6 +314,9 @@ def compute_pairwise_scores(
         pair_values = [record[0] for record in pair_records]
         atom_counts = [record[1] for record in pair_records]
         max_record = max(pair_records, key=lambda record: record[0])
+        contributing_structures = {
+            name for record in pair_records for name in record[2:4]
+        }
         mean = sum(pair_values) / len(pair_values)
         variance = sum((value - mean) ** 2 for value in pair_values) / len(pair_values)
         scores.append(
@@ -241,7 +329,7 @@ def compute_pairwise_scores(
                 max_pairwise=max(pair_values),
                 std_pairwise=math.sqrt(variance),
                 n_pairs=len(pair_values),
-                n_structures=len(observations),
+                n_structures=len(contributing_structures),
                 total_structures=len(structures),
                 min_atoms_per_pair=min(atom_counts),
                 max_atoms_per_pair=max(atom_counts),
@@ -269,6 +357,8 @@ def write_scores_csv(scores: Iterable[ResidueScore], filename: str) -> str:
         "n_structures",
         "total_structures",
         "structure_coverage",
+        "possible_pairs",
+        "pair_coverage",
         "min_atoms_per_pair",
         "max_atoms_per_pair",
         "max_pair_structure_1",
@@ -291,6 +381,8 @@ def write_scores_csv(scores: Iterable[ResidueScore], filename: str) -> str:
                     "n_structures": score.n_structures,
                     "total_structures": score.total_structures,
                     "structure_coverage": f"{score.structure_coverage:.6f}",
+                    "possible_pairs": score.possible_pairs,
+                    "pair_coverage": f"{score.pair_coverage:.6f}",
                     "min_atoms_per_pair": score.min_atoms_per_pair,
                     "max_atoms_per_pair": score.max_atoms_per_pair,
                     "max_pair_structure_1": score.max_pair_structure_1,
@@ -312,7 +404,10 @@ def _split_values(value: str) -> List[str]:
 def _optional_float(value: object) -> Optional[float]:
     if value is None or str(value).strip() == "":
         return None
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("Numeric limits must be finite")
+    return result
 
 
 def _resi_sort_key(resi: str) -> Tuple[int, str]:
@@ -344,17 +439,17 @@ def _alignment_residue_map(
     cycles: int,
     cutoff: float,
 ) -> Dict[ResidueKey, ResidueKey]:
-    fit_name = f"_flexsite_fit_{mobile}"
-    alignment_name = f"_flexsite_map_{mobile}"
-    cmd.delete(fit_name)
-    cmd.delete(alignment_name)
+    reference_ca = _alignment_ca_selection(reference_selection)
+    mobile_ca = _alignment_ca_selection(mobile_selection)
+    fit_name = cmd.get_unused_name(f"_flexsite_fit_{mobile}")
+    alignment_name = cmd.get_unused_name(f"_flexsite_map_{mobile}")
 
     # First transform the mobile onto a stable structural core. Iterative
     # rejection is useful here because genuine domain motions should not drag
     # the common reference frame.
     cmd.align(
-        f"({mobile_selection}) and name CA",
-        f"({reference_selection}) and name CA",
+        mobile_ca,
+        reference_ca,
         cutoff=float(cutoff),
         cycles=int(cycles),
         object=fit_name,
@@ -369,8 +464,8 @@ def _alignment_residue_map(
     # outlier rejection. This preserves correspondence for the mobile regions
     # whose movement we actually want to measure.
     cmd.align(
-        f"({mobile_selection}) and name CA",
-        f"({reference_selection}) and name CA",
+        mobile_ca,
+        reference_ca,
         cycles=0,
         object=alignment_name,
         transform=0,
@@ -413,25 +508,82 @@ def _extract_structure(
     object_name: str,
     site_keys: Sequence[ResidueKey],
     residue_map: Optional[Mapping[ResidueKey, ResidueKey]] = None,
+    require_same_resn: bool = False,
 ) -> StructureCoords:
     allowed = set(site_keys)
     output: StructureCoords = {}
     model = cmd.get_model(f"({object_name}) and polymer.protein", state=1)
-    alt_priority: Dict[Tuple[ResidueKey, str], int] = {}
+    grouped: Dict[ResidueKey, list] = {}
     for atom in model.atom:
         original_key = (atom.chain, atom.resi, atom.resn)
         reference_key = residue_map.get(original_key) if residue_map is not None else original_key
         if reference_key not in allowed:
             continue
-        atom_name = atom.name.strip().upper()
-        alt = (atom.alt or "").strip()
-        priority = 2 if alt == "" else 1 if alt == "A" else 0
-        slot = (reference_key, atom_name)
-        if priority < alt_priority.get(slot, -1):
+        if require_same_resn and original_key[2] != reference_key[2]:
             continue
-        output.setdefault(reference_key, {})[atom_name] = tuple(float(v) for v in atom.coord)
-        alt_priority[slot] = priority
+        grouped.setdefault(reference_key, []).append(atom)
+    for key, atoms in grouped.items():
+        coordinates = _conformer_coordinates(atoms)
+        if coordinates:
+            output[key] = coordinates
     return output
+
+
+def _conformer_atoms(atoms: Iterable[object]) -> dict:
+    """Use shared blank-alt atoms plus one coherent residue conformer.
+
+    A is preferred when available; otherwise use the conformer with the highest
+    mean occupancy, with alphabetical tie breaking. Never fill missing atoms
+    from a different conformer.
+    """
+    valid = [
+        atom for atom in atoms
+        if math.isfinite(float(atom.q)) and float(atom.q) > 0.0
+        and _valid_coord(atom.coord)
+    ]
+    occupancies: Dict[str, List[float]] = {}
+    for atom in valid:
+        alt = (atom.alt or "").strip()
+        if alt:
+            occupancies.setdefault(alt, []).append(float(atom.q))
+    selected_alt = "A" if "A" in occupancies else min(
+        occupancies,
+        key=lambda alt: (-sum(occupancies[alt]) / len(occupancies[alt]), alt),
+        default="",
+    )
+    selected = {}
+    priorities: Dict[str, Tuple[int, float]] = {}
+    for atom in valid:
+        alt = (atom.alt or "").strip()
+        if alt and alt != selected_alt:
+            continue
+        name = atom.name.strip().upper()
+        priority = (int(alt == ""), float(atom.q))
+        if priority > priorities.get(name, (-1, -1.0)):
+            selected[name] = atom
+            priorities[name] = priority
+    return selected
+
+
+def _conformer_coordinates(atoms: Iterable[object]) -> AtomCoords:
+    return {
+        name: tuple(float(v) for v in atom.coord)
+        for name, atom in _conformer_atoms(atoms).items()
+    }
+
+
+def _alignment_ca_selection(selection: str) -> str:
+    grouped: Dict[ResidueKey, list] = {}
+    for atom in cmd.get_model(selection, state=1).atom:
+        grouped.setdefault((atom.chain, atom.resi, atom.resn), []).append(atom)
+    indices = []
+    for atoms in grouped.values():
+        ca = _conformer_atoms(atoms).get("CA")
+        if ca is not None:
+            indices.append(str(ca.index))
+    if not indices:
+        raise ValueError(f"No valid protein CA atoms found in {selection}")
+    return f"({selection}) and index {'+'.join(indices)}"
 
 
 def flexsite_define_site(
@@ -482,6 +634,13 @@ def flexsite_analyze(
         raise ValueError("Provide at least one mobile object")
     if reference in mobile_objects:
         raise ValueError("Do not repeat the reference in mobiles; it is included automatically")
+    if len(set(mobile_objects)) != len(mobile_objects):
+        raise ValueError("Each mobile object must appear only once")
+
+    objects = cmd.get_object_list("all")
+    for object_name in [reference] + mobile_objects:
+        if object_name not in objects:
+            raise ValueError(f"Expected a loaded molecular object: {object_name}")
 
     chain_values = _split_values(mobile_chains)
     if chain_values and len(chain_values) != len(mobile_objects):
@@ -513,6 +672,26 @@ def flexsite_analyze(
     if metric in ("ca", "backbone"):
         symmetry_aware = False
 
+    output = output_object.strip() or f"{reference}_flex_{metric}"
+    _validate_output_name(output, [reference] + mobile_objects)
+    if effective_min_atoms < 1 or effective_min_atoms > len(atom_names):
+        raise ValueError("min_atoms is outside the valid range for this metric")
+    min_fraction = float(min_structure_fraction)
+    if not 0.0 <= min_fraction <= 1.0:
+        raise ValueError("min_structure_fraction must be between 0 and 1")
+    for name, value in (("min_identity", min_identity), ("min_coverage", min_coverage)):
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1")
+    if int(cycles) < 0 or not math.isfinite(float(cutoff)) or float(cutoff) <= 0.0:
+        raise ValueError("cycles must be non-negative and cutoff must be finite and positive")
+    fixed_min = _optional_float(color_min)
+    fixed_max = _optional_float(color_max)
+    if (fixed_min is None) != (fixed_max is None):
+        raise ValueError("Provide both color_min and color_max, or leave both empty")
+    if fixed_min is not None and fixed_max <= fixed_min:
+        raise ValueError("color_max must be greater than color_min")
+    show_colorbar = bool(int(colorbar))
+
     reference_selection = f"({reference}) and polymer.protein{_chain_clause(ref_chain)}"
     site_keys = _selected_reference_residues(reference_selection, site)
     if not site_keys:
@@ -521,7 +700,7 @@ def flexsite_analyze(
     structures: Dict[str, StructureCoords] = {
         reference: _extract_structure(reference, site_keys)
     }
-    reference_ca_count = cmd.count_atoms(f"({reference_selection}) and name CA")
+    reference_ca_count = cmd.count_atoms(_alignment_ca_selection(reference_selection))
     for mobile, chain in zip(mobile_objects, chain_values):
         mobile_selection = f"({mobile}) and polymer.protein{_chain_clause(chain)}"
         residue_map = _alignment_residue_map(
@@ -549,7 +728,9 @@ def flexsite_analyze(
                 f"(identity={identity:.1%}, reference coverage={coverage:.1%}). "
                 "Check the PDB IDs and chain selections."
             )
-        structures[mobile] = _extract_structure(mobile, site_keys, residue_map)
+        structures[mobile] = _extract_structure(
+            mobile, site_keys, residue_map, require_same_resn=(metric == "sidechain")
+        )
 
     scores = compute_pairwise_scores(
         structures,
@@ -561,23 +742,12 @@ def flexsite_analyze(
     if not scores:
         raise ValueError("No residue had enough matched atoms for a pairwise calculation")
 
-    min_fraction = float(min_structure_fraction)
-    if not 0.0 <= min_fraction <= 1.0:
-        raise ValueError("min_structure_fraction must be between 0 and 1")
     display_scores = [score for score in scores if score.structure_coverage >= min_fraction]
     if not display_scores:
         raise ValueError(
             "No residue passed min_structure_fraction; lower the threshold or inspect missing data"
         )
 
-    fixed_min = _optional_float(color_min)
-    fixed_max = _optional_float(color_max)
-    if (fixed_min is None) != (fixed_max is None):
-        raise ValueError("Provide both color_min and color_max, or leave both empty")
-    if fixed_min is not None and fixed_max is not None and fixed_max <= fixed_min:
-        raise ValueError("color_max must be greater than color_min")
-
-    output = output_object.strip() or f"{reference}_flex_{metric}"
     _color_scores_on_reference(
         reference,
         output,
@@ -588,7 +758,7 @@ def flexsite_analyze(
         hide_objects=cmd.get_object_list("all"),
         minimum=fixed_min,
         maximum=fixed_max,
-        show_colorbar=bool(int(colorbar)),
+        show_colorbar=show_colorbar,
         representation=metric,
     )
     _cache_result(scores, output, min_fraction)
@@ -620,8 +790,16 @@ def _color_scores_on_reference(
     show_colorbar: bool = True,
     representation: str = "backbone",
 ) -> None:
+    _validate_output_name(output_object, [reference])
+    owner = _view_settings(output_object).get("owner") if _owns_output(output_object) else uuid4().hex
+    # These names were validated above. Remove old representation selections
+    # before recreating the object, otherwise unused selections become empty
+    # and cannot be distinguished from unrelated names on the next analysis.
+    for suffix in ("_site", "_site_backbone", "_site_sidechain"):
+        cmd.delete(output_object + suffix)
     cmd.delete(output_object)
     cmd.create(output_object, reference, source_state=1, target_state=1)
+    cmd.set_property(_OWNER_PROPERTY, owner, output_object)
     cmd.alter(output_object, "b=-1.0")
     residue_selections = []
     for score in scores:
@@ -644,6 +822,8 @@ def _color_scores_on_reference(
         show_colorbar=show_colorbar,
         representation=representation,
     )
+    _remember_view(output_object, site_name, minimum, maximum,
+                   "sidechain" if representation == "sidechain" else "backbone")
 
 
 def _create_colorbar(
@@ -704,6 +884,8 @@ def _create_colorbar(
         cmd.hide("nonbonded", label_object)
         cmd.set("label_color", "white", label_object)
         cmd.set("label_size", 14, label_object)
+        cmd.set_property(_OWNER_PROPERTY, cmd.get_property(_OWNER_PROPERTY, output_object),
+                         label_object)
         return label_object
     except Exception as error:
         print(f"FlexSite warning: could not create color bar: {error}")
@@ -722,6 +904,11 @@ def _show_heatmap(
     representation: str = "backbone",
 ) -> None:
     """Apply an uncluttered atom-colored heatmap view."""
+    _validate_colorbar_names(output_object)
+    cmd.delete(f"{output_object}_colorbar")
+    cmd.delete(f"{output_object}_colorbar_labels")
+    if not cmd.get_property(_OWNER_PROPERTY, output_object):
+        cmd.set_property(_OWNER_PROPERTY, uuid4().hex, output_object)
     for object_name in hide_objects:
         if object_name != output_object:
             cmd.disable(object_name)
@@ -843,10 +1030,13 @@ def flexsite_show(
     scores. By default, the site selection is ``<output_object>_site``.
     """
     _require_pymol()
-    output = output_object.strip() or (_LAST_OUTPUT_OBJECT or "")
+    output = output_object.strip() or (_cached_output_object() or "")
     if not output:
         raise ValueError("Provide the FlexSite output object name")
-    site = site_selection.strip() or f"{output}_site"
+    settings = _view_settings(output)
+    if settings and not _owns_output(output):
+        raise ValueError("Cached FlexSite output was deleted or replaced; run a new analysis")
+    site = site_selection.strip() or settings.get("site", f"{output}_site")
     if cmd.count_atoms(site) == 0:
         raise ValueError(f"Site selection is empty or missing: {site}")
     values: List[float] = []
@@ -858,14 +1048,14 @@ def flexsite_show(
     fixed_max = _optional_float(color_max)
     if (fixed_min is None) != (fixed_max is None):
         raise ValueError("Provide both color_min and color_max, or leave both empty")
-    minimum = min(values) if fixed_min is None else fixed_min
-    maximum = max(values) if fixed_max is None else fixed_max
-    if maximum <= minimum:
+    if fixed_min is not None and fixed_max <= fixed_min:
         raise ValueError("color_max must be greater than color_min")
+    minimum = settings.get("minimum", min(values)) if fixed_min is None else fixed_min
+    maximum = settings.get("maximum", max(values)) if fixed_max is None else fixed_max
     if math.isclose(minimum, maximum):
         maximum = minimum + 1e-6
     objects_to_hide = cmd.get_object_list("all") if int(hide_others) else []
-    display_mode = representation.lower().strip()
+    display_mode = representation.lower().strip() or settings.get("representation", "")
     if not display_mode:
         cached = _cached_scores()
         if output == _cached_output_object() and cached:
@@ -885,6 +1075,7 @@ def flexsite_show(
         show_colorbar=bool(int(colorbar)),
         representation=display_mode,
     )
+    _remember_view(output, site, minimum, maximum, display_mode)
 
 
 def flexsite_export(filename: str = "flexsite_results.csv") -> str:
@@ -905,19 +1096,16 @@ def _residue_atom_coordinates(
 ) -> AtomCoords:
     chain_clause = f" and chain {chain}" if chain else ""
     model = cmd.get_model(
-        f"({object_name}){chain_clause} and resi {resi} and name {'+'.join(atom_names)}",
+        f"({object_name}){chain_clause} and resi {resi} and polymer.protein",
         state=1,
     )
-    coordinates: AtomCoords = {}
-    priorities: Dict[str, int] = {}
-    for atom in model.atom:
-        alt = (atom.alt or "").strip()
-        priority = 2 if alt == "" else 1 if alt == "A" else 0
-        name = atom.name.strip().upper()
-        if priority >= priorities.get(name, -1):
-            coordinates[name] = tuple(float(value) for value in atom.coord)
-            priorities[name] = priority
-    return coordinates
+    residues = {(atom.segi, atom.chain, atom.resi, atom.resn) for atom in model.atom}
+    if len(residues) > 1:
+        raise ValueError("Residue selection is ambiguous; specify one chain/residue")
+    return {
+        name: coord for name, coord in _conformer_coordinates(model.atom).items()
+        if name in atom_names
+    }
 
 
 def _residue_name(object_name: str, chain: str, resi: str) -> str:
@@ -949,6 +1137,8 @@ def flexsite_check_residue(
     second = _residue_atom_coordinates(structure_2, chain_2, second_resi, atom_names)
     first_resn = _residue_name(structure_1, chain_1, str(resi_1))
     second_resn = _residue_name(structure_2, chain_2, second_resi)
+    if sidechain_mode and first_resn != second_resn:
+        raise ValueError("Side-chain comparisons require the same amino-acid type")
     residue_name = first_resn if first_resn == second_resn else ""
     pairs = _matched_atom_pairs(
         first,
@@ -1027,7 +1217,8 @@ def flexsite_last() -> None:
         print(
             f"{score.chain}:{score.resn}{score.resi}  "
             f"mean={score.mean_pairwise:.3f} A  max={score.max_pairwise:.3f} A  "
-            f"pairs={score.n_pairs}  coverage={score.n_structures}/{score.total_structures}  "
+            f"pairs={score.n_pairs}/{score.possible_pairs}  "
+            f"coverage={score.n_structures}/{score.total_structures}  "
             f"max_pair={score.max_pair_structure_1}|{score.max_pair_structure_2}"
             f"{coverage_flag}"
         )

@@ -1,5 +1,10 @@
 # FlexSite AdK validation
 
+The reliability update is described in [CHANGELOG.md](CHANGELOG.md). The
+archived numerical results below were reproduced with the repaired code.
+New exports include `possible_pairs` and `pair_coverage`; the original root CSV
+files retain their historical schema.
+
 FlexSite was tested with chain A from `1AKE` (closed reference), `4AKE`
 (open), and `7APU` (ADP-bound). The binding site was defined as reference
 residues within 6 A of AP5 in `1AKE`.
@@ -71,9 +76,11 @@ of 14.165584, 15.609756, 18.391821, 20.169420, and 22.580064 A. Their RMS is
 reconstructed the view using `flexsite_show`, confirming that cached side-chain
 results retain the correct line representation and color scale.
 
-This validation establishes that the prototype's main calculation,
-correspondence mapping, filtering, reporting, and visualization work on this
-test set. It does not by itself establish a general biological interpretation
+This validation exercises the prototype's calculation, correspondence mapping,
+filtering, reporting, and visualization on this test set. The manual checker
+shares atom-matching code with the analysis and is a diagnostic, not an
+independent implementation. Numerical fixtures and archived AdK values are also
+checked by the regression suite. This does not establish a general biological interpretation
 for every protein ensemble; chain selection, ligand/site definition, alignment
 protocol, crystal packing, mutations, and missing atoms still need to be
 controlled for each study.

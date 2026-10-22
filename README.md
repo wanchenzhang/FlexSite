@@ -78,14 +78,23 @@ flexsite_last
 flexsite_export flexsite_results.csv
 ```
 
-By default, only residues present in at least 80% of the input structures are
-colored. Lower-coverage residues remain gray but are retained in the CSV. The
+By default, only residues for which at least 80% of the input structures
+contribute to a valid atom-matched pair are colored. Residues with too few usable
+atoms do not count as contributing structures. Lower-coverage residues remain
+gray but are retained in the CSV. The
 CSV and `flexsite_last` also identify the two structures that produce each
 residue's maximum pairwise RMSD.
 
 The reference is included automatically. Do not include it again in `mobiles`.
 The output object is named `adk_closed_flex_backbone` by default, and its scored
 site selection is named `adk_closed_flex_backbone_site`.
+
+Choose an output name containing only letters, digits, and underscores. The
+tool refuses to replace an input structure or an unrelated existing object.
+Reusing a FlexSite output name replaces that result. Alignment transforms the
+mobile objects in place, so use working copies if you need the original poses.
+When upgrading from an earlier version, start a fresh PyMOL session and rerun
+the analysis so that new output ownership markers and coverage values are used.
 
 After analysis, the input ensemble is disabled so it cannot cover the heatmap.
 The output is focused on the binding site. Backbone RMSD is shown by default as
@@ -112,6 +121,12 @@ flexsite_show(
 )
 python end
 ```
+
+`flexsite_show` remembers each output's representation and color range within
+the current PyMOL process, including after reloading `flexsite.py`. Omitting the
+object name restores the last analyzed output. These cached settings are not
+guaranteed to survive closing PyMOL or a new process; run the analysis again in
+that case.
 
 To require complete structural coverage during a new analysis:
 
@@ -185,6 +200,12 @@ Equivalent terminal or branch names are symmetry-corrected for ASP, GLU, ARG,
 LEU, VAL, PHE, and TYR. For example, swapping ASP `OD1` and `OD2` labels alone
 does not create an artificial difference.
 
+Only pairs with identical amino-acid types are compared in side-chain mode.
+Mutated positions in a mobile structure are excluded from that residue's
+side-chain observations, while backbone mode may still compare their backbones.
+Symmetry swaps require the complete equivalent atom group in both structures;
+incomplete groups use conservative same-name matching.
+
 To independently check one aligned side chain:
 
 ```pml
@@ -225,9 +246,14 @@ valid `N(N-1)/2` structure pairs. For the `ca` metric, there is only one atom, s
 the value is a C-alpha distance rather than an atom-set RMSD.
 
 The CSV also reports maximum, population standard deviation, number of valid
-pairs, number of structures containing the residue, and the minimum/maximum atom
-count used by any valid pair. A backbone pair requires at least three of the four
-requested backbone atoms by default.
+pairs, number of contributing structures, and the minimum/maximum atom count
+used by any valid pair. A backbone pair requires at least three of the four
+requested backbone atoms by default. `possible_pairs` is the total number of
+ensemble pairs, while `pair_coverage = n_pairs / possible_pairs` exposes how many
+comparisons actually contributed. Structure coverage and pair coverage differ:
+every structure can participate in at least one pair without all pairs being
+valid. The default display threshold applies to structure coverage only; inspect
+pair coverage and atom counts before comparing residues with missing data.
 
 ## Scientific and technical limitations
 
@@ -247,7 +273,11 @@ requested backbone atoms by default.
   from producing a visually plausible but meaningless heatmap.
 - Residues are mapped from the C-alpha alignment. Unmapped or missing residues
   do not contribute to a pair.
-- Alternate location blank is preferred, followed by alternate location `A`.
+- Shared blank-alt atoms are combined with one consistent residue conformer.
+  Alternate `A` is preferred; if it is absent, the highest mean occupancy wins
+  (alphabetical tie breaking). Missing atoms are not filled from another
+  conformer. The same choice is used for coordinate extraction and C-alpha
+  alignment; zero-occupancy and non-finite atoms are excluded.
 - Side-chain RMSD is calculated after the same global structural alignment as
   backbone RMSD; no per-residue local fit is applied. It therefore captures
   both domain/backbone displacement and side-chain conformational change.
@@ -267,8 +297,13 @@ This persistence begins with the first analysis performed by this version.
 ## Run the numerical tests outside PyMOL
 
 ```powershell
-python -m unittest -v test_flexsite.py
+python -m unittest discover -v
 ```
+
+With a standard Python interpreter, numerical tests run and PyMOL integration
+tests are explicitly skipped. To run the complete suite, use a Python interpreter
+that can import PyMOL. GitHub Actions runs numerical tests on Windows and Linux
+with Python 3.9 and 3.13; it does not install PyMOL.
 
 ## Reproduce the AdK example
 
@@ -312,10 +347,12 @@ results are generated by FlexSite and are distinct from the cited publications.
 
 - `flexsite.py`: PyMOL commands and numerical core.
 - `test_flexsite.py`: numerical tests.
+- `test_pymol_integration.py`: real PyMOL and AdK regression tests.
 - `examples/`: portable AdK validation scripts.
 - `structures/`: source mmCIF files for offline reproduction.
 - `adk*.csv` and `adk*.png`: original validation data and figures.
 - `VALIDATION.md`: validation methods, results, and interpretation.
+- `CHANGELOG.md`: repair notes and verification scope.
 
 No software license has been selected yet. Before reusing or distributing the
 code, obtain permission from the rights holder. PDB data have their own terms;
